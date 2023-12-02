@@ -1,4 +1,5 @@
 import csv
+import datetime
 import json
 import os
 import re
@@ -46,16 +47,32 @@ def load_api_key():
         encrypted_api_key = file.read()
     return decrypt_message(encrypted_api_key, key)
 
-# Function to combine task details, including subtasks and comments
 def combine_task_details(task):
-    """ Combine details of a task including subtasks and comments. """
     task_details = client.tasks.find_by_id(task['gid'])
     task_details['subtasks'] = get_all_subtasks(task['gid'])
 
-    comments = client.stories.get_stories_for_task(task['gid'], {'resource_subtype': 'comment'})
-    task_details['comments'] = [comment for comment in comments]
+    # Simplify assignee representation
+    if 'assignee' in task_details and task_details['assignee']:
+        task_details['assignee'] = task_details['assignee']['name']
 
+    # Fetch comments without filtering by 'resource_subtype' initially
+    comments = client.stories.get_stories_for_task(task['gid'])
+    logging.debug(f"Raw comments for task {task['gid']}: {comments}")  # Add this line for debugging
+
+    simplified_comments = []
+    for comment in comments:
+        print(comment)
+        # Filter out specific subtypes and types if needed
+        # The instruction is not clear, so I will assume that the filtering process is not working correctly.
+        # I will modify the condition to check if 'resource_subtype' and 'resource_type' exist in the comment before comparing their values.
+        if 'resource_subtype' in comment and 'resource_type' in comment:
+            if comment['resource_subtype'] == 'comment_added' and comment['resource_type'] == 'story':
+                creator_time = f"{comment['created_by']['name']} - {comment['created_at']}"
+                simplified_comments.append({'creator_time': creator_time, 'text': comment['text']})
+
+    task_details['comments'] = simplified_comments
     return task_details
+
 
 # Function to ask for API key decision
 def ask_for_api_key_decision():
@@ -73,6 +90,7 @@ def ask_for_api_key_decision():
     new_api_key = getpass('Enter your Asana API Key: ')
     save_api_key(new_api_key)
     return new_api_key
+
 
 # Check if encryption key exists, if not, generate one
 if not os.path.exists('secret.key'):
@@ -111,16 +129,23 @@ def get_project_name(project):
     """ Format project name to be file-system friendly. """
     return re.sub('_+', '_', re.sub('[^0-9a-zA-Z]+', '_', project.lower().replace(' ', '_')))
 
-def export_tasks(all_tasks, format_choice, project_name):
-    """ Export tasks to a file in the chosen format. """
-    filename = f'asana_tasks_{project_name}.{format_choice.lower()}'
+def export_tasks(all_tasks, format_choice, project_name, task_status, export_basic_fields):
+    """ Export tasks to a file in the chosen format, including task status and timestamp in filename. """
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    status_label = task_status.replace(' ', '_')
+    filename = f'asana_tasks_{project_name}_{status_label}_{timestamp}.{format_choice.lower()}'
+
+    # Process tasks based on field selection
+    if export_basic_fields:
+        basic_fields = ['name', 'created_at', 'due_on', 'notes', 'assignee', 'comments']  # Ensure 'comments' is included
+        all_tasks = [{field: task[field] for field in basic_fields if field in task} for task in all_tasks]
+
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as file:
             if format_choice == 'YAML':
                 yaml.dump(all_tasks, file)
             elif format_choice == 'CSV':
                 writer = csv.writer(file)
-                # Assuming all tasks have the same structure
                 headers = all_tasks[0].keys()
                 writer.writerow(headers)
                 for task in all_tasks:
@@ -130,6 +155,37 @@ def export_tasks(all_tasks, format_choice, project_name):
             logging.info(f"Tasks exported successfully to {filename}")
     except Exception as e:
         logging.error(f"Error exporting tasks: {e}")
+
+
+def export_project_tasks(project, task_status, format_choice, export_basic_fields):
+    """ Fetch and export tasks for a given project. """
+    tasks_generator = client.tasks.find_by_project(project['gid'])
+    tasks = list(tasks_generator)
+
+    all_tasks = []
+
+    with tqdm(total=len(tasks), desc=f"Exporting tasks from {project['name']}", unit="task") as pbar:
+        for task in tasks:
+            combined_task = combine_task_details(task)
+            all_tasks.append(combined_task)
+            pbar.update(1)
+
+    # Filter tasks based on completion status after combining
+    if task_status == 'Complete Tasks':
+        all_tasks = [task for task in all_tasks if task.get('completed')]
+    elif task_status == 'Incomplete Tasks':
+        all_tasks = [task for task in all_tasks if not task.get('completed')]
+
+    # Print task status
+    print(f"Task Status: {task_status}")
+
+    # Print the tasks on the console
+    for task in all_tasks:
+        for attribute, value in task.items():
+            print(f"{attribute}: {value}")
+
+    export_tasks(all_tasks, format_choice, get_project_name(project['name']), task_status, export_basic_fields)
+
 
 def main():
     """ Main function to handle user interaction and orchestrate data fetching and exporting. """
@@ -143,7 +199,7 @@ def main():
                       choices=['YAML', 'CSV', 'JSON'],
                       )])['format']
 
-    # Fetch workspaces and projects
+    # Fetch workspaces
     workspaces = list(client.workspaces.find_all())
     workspace_choice = inquirer.prompt([
         inquirer.List('workspace',
@@ -152,27 +208,37 @@ def main():
                       )])['workspace']
     selected_workspace = next(workspace for workspace in workspaces if workspace['name'] == workspace_choice)
 
+    # Fetch projects
     projects = list(client.projects.find_by_workspace(selected_workspace['gid']))
+    project_choices = [project['name'] for project in projects] + ["All Projects"]
     project_choice = inquirer.prompt([
         inquirer.List('project',
-                      message="Select a project",
-                      choices=[project['name'] for project in projects],
+                      message="Select a project or 'All Projects'",
+                      choices=project_choices,
                       )])['project']
-    selected_project = next(project for project in projects if project['name'] == project_choice)
 
-    # Fetch tasks and export
-    tasks_generator = client.tasks.find_by_project(selected_project['gid'])
-    tasks = list(tasks_generator)  # Convert generator to a list
+    # Task completion status option
+    task_status = inquirer.prompt([
+        inquirer.List('status',
+                      message="Select tasks to export",
+                      choices=['All Tasks', 'Complete Tasks', 'Incomplete Tasks'],
+                      )])['status']
 
-    all_tasks = []
+    # Add this inside the main() function, after selecting the task status
+    export_basic_fields = inquirer.prompt([
+        inquirer.Confirm('basic_fields', message="Do you want to export only basic fields (e.g., name, but not GID)?", default=False)
+    ])['basic_fields']
 
-    with tqdm(total=len(tasks), desc="Exporting tasks", unit="task") as pbar:
-        for task in tasks:
-            all_tasks.append(combine_task_details(task))
-            pbar.update(1)  # Update the progress bar for each task processed
 
-    project_name = get_project_name(selected_project['name'])
-    export_tasks(all_tasks, format_choice, project_name)
+    # Fetch and export tasks
+    if project_choice == "All Projects":
+        for project in projects:
+            export_project_tasks(project, task_status, format_choice, export_basic_fields)
+    else:
+        selected_project = next(project for project in projects if project['name'] == project_choice)
+        export_project_tasks(selected_project, task_status, format_choice, export_basic_fields)
+
+
 
 if __name__ == "__main__":
     main()
